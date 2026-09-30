@@ -1,7 +1,7 @@
 const { readFileSync, writeFileSync, existsSync } = require('node:fs');
 const { join } = require('node:path');
 
-const STAGES = ['planning', 'issues', 'pipeline', 'smoketest', 'fix', 'done', 'failed'];
+const STAGES = ['planning', 'issues', 'pipeline', 'smoketest', 'obsidian-record', 'fix', 'done', 'failed'];
 
 function createState({ id, title, description, projectId, githubRepo = null, branch = null, branchSource = 'auto' }) {
   const now = new Date().toISOString();

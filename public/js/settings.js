@@ -512,6 +512,13 @@ function saveConfig() {
     const existing = state.cfg.commands[i] || {};
     const command = card.querySelector('.agent-command').value.trim() || state.cfg.defaultShell;
     return {
+      // Spread `existing` first so any field not explicitly managed by this
+      // form (presetId, custom telemetry settings, future additions) survives
+      // the round-trip. Without this, plugin-spawned sessions break the next
+      // time anyone clicks Save in the agent settings — they rely on
+      // cfg.commands[].presetId to resolve the right command, but that field
+      // was being silently dropped.
+      ...existing,
       id: existing.id || randomId(),
       label: card.querySelector('.agent-name').value.trim() || 'Untitled',
       icon: existing.icon || 'terminal',

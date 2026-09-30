@@ -1,5 +1,6 @@
 const { join } = require('node:path');
 const path = require('node:path');
+const { isValidBranch } = require('../branch');
 
 function pickNextIssue(issues) {
   if (!Array.isArray(issues)) return null;
@@ -8,6 +9,12 @@ function pickNextIssue(issues) {
 }
 
 function build(s, dir) {
+  if (!isValidBranch(s.branch)) {
+    throw new Error(
+      `pipeline: state.branch is not a valid git ref name (got ${JSON.stringify(s.branch)}). ` +
+      `Edit ${join(dir, 'state.json')} and set "branch" to a slug like "feat/snake-game" before resuming.`,
+    );
+  }
   const summaryJsPath = path.resolve(__dirname, '..', 'summary.js');
   const pluginRoot = path.resolve(__dirname, '..', '..');
   const stageName = 'pipeline';
@@ -26,16 +33,20 @@ function buildStepPrompt({ s, dir, issue, retryContext, pluginRoot }) {
 
   const doneCount = (s.issues || []).filter((i) => i.status === 'done').length;
   const total = (s.issues || []).length;
-  return `Per-step pipeline worker for CliDeck Workflow ${s.title || s.id}.
+  return `Per-step pipeline worker for CliDeck Workflow ${s.id}.
 Execute EXACTLY ONE plan step then exit. The runner spawns you again for the next step — do not loop.
 
 CONTEXT FILE: ${join(dir, 'state.json')}
 THIS STEP: state.issues entry with order=${issue.order}, number=${issue.number}, title="${issue.title || ''}". Read its \`body\` — that is your spec.
+
+BRANCH (use this EXACT string for every git operation; do NOT derive from state.title or anywhere else):
+    ${s.branch}
+The runner has already validated this against \`git check-ref-format --branch\`. Quote it in shell commands but do NOT modify, slugify, or substitute it.
 ${retryContext}${ciFailureCtx}
 Follow the \`issue-pipeline\` skill's per-issue worker protocol (Step 4a) for the standard implement → verify → commit flow. Invoke it with the Skill tool. Apply these CliDeck overrides:
 
 - Worktree: \`git worktree add ../wt-${s.id}-${issue.number} ${s.branch}\` if not already present (or reuse an existing checkout already on \`${s.branch}\`); cd in.
-- Repo is \`${s.githubRepo}\`. Branch is \`${s.branch}\`. Issue is #${issue.number}.
+- Repo is \`${s.githubRepo}\`. Branch is \`${s.branch}\` (NOT the workflow title). Issue is #${issue.number}.
 - Push to the \`plugin\` remote: \`git push plugin ${s.branch}\` (NOT origin).
 - Commit subject: \`feat(${issue.number}): ${(issue.title || '').replace(/`/g, "'")}\`. Body MUST include a "Verified by:" line listing the exact verification commands you ran.
 - For static-web projects without a test runner, verify with \`python3 -m http.server\` + headless Chrome via DevTools Protocol and save console errors + failed requests + screenshot under \`pipeline-evidence/issue-${issue.number}/\`.
@@ -72,4 +83,8 @@ ON FAILURE: write brief failure to ${join(dir, 'done', 'pipeline.failed')} inste
 `;
 }
 
-module.exports = { preset: 'claude-code', build, pickNextIssue };
+// Per-step pipeline workers do mechanical implement → verify → commit cycles.
+// Sonnet handles this faster and cheaper than Opus; the planning + issues stages
+// (which still default to whatever the user has configured) handle the harder
+// design-and-decompose work.
+module.exports = { preset: 'claude-code', extraArgs: ['--model', 'sonnet'], build, pickNextIssue };

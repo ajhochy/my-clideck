@@ -1,3 +1,7 @@
+---
+type: project
+---
+
 # Project State — my-clideck
 
 ## Current focus
