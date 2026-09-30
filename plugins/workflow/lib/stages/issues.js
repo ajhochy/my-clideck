@@ -17,7 +17,8 @@ Labels: 1=detect-repo, 2=create-issues, 3=order, 4=write-state, 5=signal.
 STEP 1 — Detect repository. Run \`gh repo view --json nameWithOwner\` (or \`git remote get-url origin\`). If GitHub is detected, set state.githubRepo = "<owner>/<name>"; otherwise leave null and proceed in local-TODO mode.
 
 STEP 2 — Create issues (or local TODOs).
-GitHub mode: create one milestone titled "${s.title || 'Workflow'}". For each atomic step in plan.steps, create a GitHub issue under it via \`gh issue create --milestone …\` — title = step title, body = step body verbatim (file paths, function names, expected behavior, dependencies, coherence-rule refs). Capture the issue numbers.
+Before creating, FILTER OUT any plan.steps whose purpose is end-to-end smoketesting, UI-evidence capture, screenshot capture, headless-browser playthrough, or final-build verification. Those are the smoketest stage's job (codex, post-pipeline) — they are not pipeline issues. Heuristics to drop a step: title contains "smoketest", "evidence", "playthrough", "screenshot capture", or it's the literal "Verify build + commit" wrap-up step. Per-step unit-level verification is fine and stays.
+GitHub mode: create one milestone titled "${s.title || 'Workflow'}". For each remaining atomic step in plan.steps, create a GitHub issue under it via \`gh issue create --milestone …\` — title = step title, body = step body verbatim (file paths, function names, expected behavior, dependencies, coherence-rule refs). Capture the issue numbers.
 Local mode: build synthetic IDs (T1, T2, …) with identical bodies.
 
 STEP 3 — Suggest implementation order from atomic-step dependencies (no-dep first, downstream after). Record dependency edges so Stage 3 can verify.

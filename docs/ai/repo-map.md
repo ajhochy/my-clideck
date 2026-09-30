@@ -1,3 +1,7 @@
+---
+type: project
+---
+
 # Repo Map — my-clideck
 
 Personal fork of CliDeck. `origin` = upstream [rustykuntz/clideck](https://github.com/rustykuntz/clideck); `plugin` = this fork ([ajhochy/my-clideck](https://github.com/ajhochy/my-clideck)). Push fork work to `plugin`.
