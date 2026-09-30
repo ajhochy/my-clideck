@@ -30,7 +30,7 @@ Land the workflow reliability changes in the working tree, then adopt `docs/ai/`
 
 ## Consolidation 2026-09-29
 Non-destructive git consolidation. Nothing was deleted; the cleanup script below is for the user to review and run.
-- **Mega branch:** `mega/2026-09-29-consolidation` (push remote is `plugin` = ajhochy/my-clideck; `origin` = upstream rustykuntz/clideck, never pushed to). PR: PR_URL_PLACEHOLDER. Tracking issue: ISSUE_URL_PLACEHOLDER.
+- **Mega branch:** `mega/2026-09-29-consolidation` (push remote is `plugin` = ajhochy/my-clideck; `origin` = upstream rustykuntz/clideck, never pushed to). PR: https://github.com/ajhochy/my-clideck/pull/41. Tracking issue: https://github.com/ajhochy/my-clideck/issues/42.
 - **Folded:** `wip/my-clideck-2026-09-29` (bd27b13) = WIP snapshot of the main checkout (the "Uncommitted working-tree changes" listed above are now committed on mega).
 - **Dropped (all preserved in bundle `~/Documents/.consolidation-backups/my-clideck-2026-09-29.bundle`):**
   - Already merged into `plugin/main` (ancestor): `claude/elated-mahavira-15a20f` (dcae68d), `claude/elated-ritchie-cdd98e` (03f48e9), `claude/peaceful-bassi-fc312a` (5d5576c), `claude/peaceful-moore-18d0c2` (086c5c7), `claude/romantic-yonath-9f83b6` (2cd05b3), `feat/cli-deck-3` (355c564), `feat/codex-config-stable` (5ab7e6a), `feat/delete-fix` (72b569e), `feat/lean-pipeline` (5104372), `feat/lean-pipeline-pr` (0d0e8c4), `feat/workflow-plugin` (aec51ba), `ui-progress-update` (5684f57); remote `plugin/feat/cli-deck-3`, `plugin/feat/codex-config-stable`, `plugin/feat/delete-fix`, `plugin/feat/workflow-names` (b66a121).
