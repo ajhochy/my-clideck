@@ -5,7 +5,7 @@ const fixmod = require('./fix-subworkflow');
 const { createLogger } = require('./logger');
 const { pollPrChecks } = require('./ci-poller');
 
-const SEQUENCE = ['planning', 'issues', 'pipeline', 'manual-setup', 'smoketest'];
+const SEQUENCE = ['planning', 'issues', 'pipeline', 'manual-setup', 'smoketest', 'obsidian-record'];
 const MAX_CI_RETRIES_PER_ISSUE = 3;
 
 function nextStage(current) {
@@ -14,13 +14,47 @@ function nextStage(current) {
   return SEQUENCE[i + 1];
 }
 
-function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, maxFixAttempts = 2 }) {
+function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, maxFixAttempts = 2, _pollPrChecks = null, _closeIssue = null }) {
   let watcher = null;
   let currentSession = null;
   let currentLock = null;
 
   const wfLog = createLogger({ dir, stage: 'runner' });
   const sessionStreams = new Map();
+
+  // Close a GitHub issue by number. Skips local T-prefixed synthetic IDs.
+  // Fire-and-forget: never throws or blocks the runner.
+  function closeIssue(repo, issueNumber) {
+    // Skip local synthetic IDs (strings like "T1") and no-repo local mode.
+    if (!repo || typeof issueNumber !== 'number') return;
+    if (_closeIssue) { _closeIssue(repo, issueNumber); return; }
+    try {
+      require('node:child_process').execFile(
+        'gh', ['issue', 'close', String(issueNumber), '--repo', repo],
+        { timeout: 10000 }, () => {},
+      );
+    } catch {}
+  }
+
+  // Keep stageProgress.pipeline in sync with state.issues so the dashboard row
+  // doesn't get stuck on "issue 13 pushed, awaiting CI" after an issue advances.
+  // Called whenever the runner — not the per-step agent — moves the pipeline forward.
+  function updatePipelineProgress(label) {
+    try {
+      state.update(dir, (c) => {
+        const issues = Array.isArray(c.issues) ? c.issues : [];
+        const total = issues.length;
+        const doneCount = issues.filter((i) => i.status === 'done').length;
+        if (!c.stageProgress || typeof c.stageProgress !== 'object') c.stageProgress = {};
+        c.stageProgress.pipeline = {
+          current: doneCount,
+          total: total || 1,
+          label: String(label || ''),
+          updatedAt: new Date().toISOString(),
+        };
+      });
+    } catch {}
+  }
 
   async function spawnCurrentStage() {
     const s = state.read(dir);
@@ -53,13 +87,21 @@ function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, 
 
     try { wfLog.event('stage_spawn_attempt', { stage: s.currentStage, fixAttempts: s.fixAttempts?.length || 0 }); } catch {}
 
+    // Keep the dashboard row in sync the moment we begin a new pipeline step
+    // (the per-step agent only updates progress *after* it pushes, which can
+    // be many minutes later).
+    if (s.currentStage === 'pipeline') {
+      const next = (s.issues || []).find((i) => i.status !== 'done');
+      if (next) updatePipelineProgress(`issue ${next.number} in progress`);
+    }
+
     if (lockFor) {
       const lockPromise = lockFor(s.currentStage, s.id);
       if (lockPromise) currentLock = await lockPromise;
     }
     const prompt = stage.build(s, dir);
     const sid = api.createSession({
-      name: `Workflow ${s.title || s.id} · ${s.currentStage}`,
+      name: `${s.currentStage} · ${s.title || s.id}`,
       presetId: stage.preset || 'claude-code',
       projectId: s.projectId,
       extraArgs: stage.extraArgs || [],
@@ -79,8 +121,15 @@ function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, 
 
     if (sid && prompt) {
       // Agents need a few seconds to boot before they accept input.
+      // Send the prompt, then submit. Claude Code uses bracketed-paste mode
+      // for multi-line input; if we send Enter too quickly after the paste,
+      // the terminal can leave it in "collapsed paste" state waiting for
+      // another keypress instead of submitting. Wait long enough for the paste
+      // bracket to close, then send Enter twice (the second is a safety net
+      // for the case where the first arrived during paste expansion).
       setTimeout(() => { try { api.inputToSession(sid, prompt); } catch {} }, 4000);
-      setTimeout(() => { try { api.inputToSession(sid, '\r'); } catch {} }, 4250);
+      setTimeout(() => { try { api.inputToSession(sid, '\r'); } catch {} }, 5500);
+      setTimeout(() => { try { api.inputToSession(sid, '\r'); } catch {} }, 6200);
     }
   }
 
@@ -111,12 +160,14 @@ function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, 
         const i = c.issues.find((x) => x.number === pushed.number);
         if (i) { i.status = 'done'; }
       });
+      closeIssue(repo, pushed.number);
       spawnCurrentStage();
       return;
     }
 
     try { wfLog.event('ci_poll_start', { issue: pushed.number, pr: prNum, repo }); } catch {}
-    const result = await pollPrChecks({
+    const poll = _pollPrChecks || pollPrChecks;
+    const result = await poll({
       prNumber: prNum,
       repo,
       onPoll: (snap) => { try { wfLog.event('ci_poll', { issue: pushed.number, snap }); } catch {} },
@@ -131,6 +182,9 @@ function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, 
           delete i.lastCiFailure;
         }
       });
+      closeIssue(repo, pushed.number);
+      const passedReason = result.state === 'no-checks' ? 'no CI configured' : 'CI passed';
+      updatePipelineProgress(`issue ${pushed.number} ${passedReason}`);
       spawnCurrentStage();
       return;
     }
@@ -230,7 +284,7 @@ function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, 
         if (willRetry) {
           try { sessionStreams.get(sid)?.close({ stage: stageDone }); sessionStreams.delete(sid); } catch {}
           // Clear all markers
-          for (const m of ['planning', 'issues', 'pipeline', 'manual-setup', 'smoketest']) {
+          for (const m of ['planning', 'issues', 'pipeline', 'manual-setup', 'smoketest', 'obsidian-record']) {
             try { unlinkSync(join(dir, 'done', `${m}.done`)); } catch {}
           }
           fixmod.startFixAttempt(dir, state);
@@ -245,9 +299,13 @@ function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, 
         return;
       }
       try { sessionStreams.get(sid)?.close({ stage: stageDone }); sessionStreams.delete(sid); } catch {}
-      const done = state.update(dir, (cur) => { cur.currentStage = 'done'; });
-      try { wfLog.event('stage_done', { from: stageDone, to: done.currentStage }); } catch {}
-      onAdvance(done);
+      // Smoketest passed — advance to the obsidian-record stage to write a
+      // permanent note + send a notification. That stage's done handler will
+      // fall through to the default flow and land on 'done'.
+      const advanced = state.update(dir, (cur) => { cur.currentStage = 'obsidian-record'; });
+      try { wfLog.event('stage_done', { from: stageDone, to: advanced.currentStage }); } catch {}
+      onAdvance(advanced);
+      spawnCurrentStage();
       return;
     }
 
@@ -272,6 +330,15 @@ function createRunner({ dir, api, stages, onAdvance = () => {}, lockFor = null, 
 
   function start() {
     watcher = watch(join(dir, 'done'), { persistent: false }, (_evt, fn) => handleMarker(fn));
+    // On resume: if a step is already pushed (PR opened, CI in flight), don't
+    // spawn a new per-step agent — that would redo completed work. Jump
+    // straight to CI polling, same path the runner takes after a fresh push.
+    const s = state.read(dir);
+    if (s.currentStage === 'pipeline' && (s.issues || []).some((i) => i.status === 'pushed')) {
+      try { wfLog.event('resume_ci_poll', { from: 'start' }); } catch {}
+      handleStepDone();
+      return;
+    }
     spawnCurrentStage();
   }
 

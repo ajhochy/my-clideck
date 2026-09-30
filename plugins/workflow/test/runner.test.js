@@ -164,6 +164,122 @@ test('runner re-spawns stage once on .failed marker, then gives up on second fai
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('runner closes GitHub issue after CI passes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wfci-'));
+  try {
+    const id = 'wf-ci';
+    const dir = initFolder(root, id);
+    const s = state.createState({ id, title: 't', description: 'd', projectId: 'p', branch: 'feat/x' });
+    s.currentStage = 'pipeline';
+    s.githubRepo = 'owner/repo';
+    s.pr = { number: 42, url: 'https://github.com/owner/repo/pull/42' };
+    s.issues = [{ number: 7, title: 'Do thing', order: 1, status: 'pushed', dependencies: [], body: '' }];
+    state.write(dir, s);
+
+    const closedIssues = [];
+    const fakeApi = { createSession: () => 'sess', closeSession: () => {}, log: () => {}, inputToSession: () => {} };
+    const runner = createRunner({
+      dir,
+      api: fakeApi,
+      stages: {
+        pipeline: { build: () => 'P', extraArgs: [] },
+        'manual-setup': { build: () => 'M' },
+        smoketest: { build: () => 'S' },
+        'obsidian-record': { build: () => 'O' },
+      },
+      onAdvance: () => {},
+      _pollPrChecks: async () => ({ state: 'passed' }),
+      _closeIssue: (repo, num) => closedIssues.push({ repo, num }),
+    });
+
+    runner.start();
+    await tick(50);
+    writeFileSync(join(dir, 'done', 'step.done'), '');
+    await tick(200);
+    runner.stop();
+
+    assert.equal(closedIssues.length, 1, 'one issue closed');
+    assert.equal(closedIssues[0].repo, 'owner/repo');
+    assert.equal(closedIssues[0].num, 7);
+    assert.equal(state.read(dir).issues[0].status, 'done');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('runner closes GitHub issue when no PR yet (optimistic path)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wfnp-'));
+  try {
+    const id = 'wf-nopr';
+    const dir = initFolder(root, id);
+    const s = state.createState({ id, title: 't', description: 'd', projectId: 'p', branch: 'feat/x' });
+    s.currentStage = 'pipeline';
+    s.githubRepo = 'owner/repo';
+    s.pr = null; // no PR yet
+    s.issues = [{ number: 3, title: 'First', order: 1, status: 'pushed', dependencies: [], body: '' }];
+    state.write(dir, s);
+
+    const closedIssues = [];
+    const fakeApi = { createSession: () => 'sess', closeSession: () => {}, log: () => {}, inputToSession: () => {} };
+    const runner = createRunner({
+      dir,
+      api: fakeApi,
+      stages: {
+        pipeline: { build: () => 'P', extraArgs: [] },
+        'manual-setup': { build: () => 'M' },
+        smoketest: { build: () => 'S' },
+        'obsidian-record': { build: () => 'O' },
+      },
+      onAdvance: () => {},
+      _closeIssue: (repo, num) => closedIssues.push({ repo, num }),
+    });
+
+    runner.start();
+    await tick(50);
+    writeFileSync(join(dir, 'done', 'step.done'), '');
+    await tick(200);
+    runner.stop();
+
+    assert.equal(closedIssues.length, 1, 'issue closed even without a PR');
+    assert.equal(closedIssues[0].repo, 'owner/repo');
+    assert.equal(closedIssues[0].num, 3);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('runner skips close for local synthetic issue IDs (T-prefix)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wfsy-'));
+  try {
+    const id = 'wf-syn';
+    const dir = initFolder(root, id);
+    const s = state.createState({ id, title: 't', description: 'd', projectId: 'p', branch: 'feat/x' });
+    s.currentStage = 'pipeline';
+    s.githubRepo = null; // local mode
+    s.issues = [{ number: 'T1', title: 'Local', order: 1, status: 'pushed', dependencies: [], body: '' }];
+    state.write(dir, s);
+
+    const closedIssues = [];
+    const fakeApi = { createSession: () => 'sess', closeSession: () => {}, log: () => {}, inputToSession: () => {} };
+    const runner = createRunner({
+      dir,
+      api: fakeApi,
+      stages: {
+        pipeline: { build: () => 'P', extraArgs: [] },
+        'manual-setup': { build: () => 'M' },
+        smoketest: { build: () => 'S' },
+        'obsidian-record': { build: () => 'O' },
+      },
+      onAdvance: () => {},
+      _closeIssue: (repo, num) => closedIssues.push({ repo, num }),
+    });
+
+    runner.start();
+    await tick(50);
+    writeFileSync(join(dir, 'done', 'step.done'), '');
+    await tick(200);
+    runner.stop();
+
+    assert.equal(closedIssues.length, 0, 'no close for local synthetic IDs');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('runner marks failed when max fix attempts exceeded', async () => {
   const root = mkdtempSync(join(tmpdir(), 'wfmx-'));
   try {

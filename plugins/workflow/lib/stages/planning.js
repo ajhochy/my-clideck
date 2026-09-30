@@ -27,6 +27,8 @@ PHASE 3 — Design the architecture that aligns with the existing codebase. Do n
 
 PHASE 4 — Write the plan as atomic steps. Each step MUST contain: file paths (with line ranges where relevant), function/symbol names, expected behavior, dependencies, coherence rules. Each atomic step must be self-contained — no re-reading the codebase to execute it.
 
+DO NOT include smoketest, end-to-end UI verification, headless-browser evidence capture, screenshot capture, "manual playthrough", or final-build verification as plan steps. The dedicated smoketest stage runs after the pipeline using codex with sandbox bypass and is responsible for ALL UI/integration verification. Per-step pipeline workers only do per-issue implement → unit-verify → commit. Examples to OMIT from the plan: "Smoketest evidence capture", "Verify final build + commit", "Capture playthrough video", "Run full integration test in browser". Each implementation step's own per-issue verification (unit tests, type checks, lint) is fine — that's not what this rule restricts.
+
 PHASE 5 — Write \`state.json.plan = { steps: [...], coherenceRules: [...] }\` via node script or jq, not hand-edit.
 
 PHASE 6 — Print \`WORKFLOW_STAGE_DONE: planning\`, then \`touch ${join(dir, 'done', 'planning.done')}\` and stop.

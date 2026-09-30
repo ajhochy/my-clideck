@@ -30,6 +30,7 @@ const stages = {
   pipeline: require('./lib/stages/pipeline'),
   'manual-setup': require('./lib/stages/manual-setup'),
   smoketest: require('./lib/stages/smoketest'),
+  'obsidian-record': require('./lib/stages/obsidian-record'),
 };
 
 module.exports = {
@@ -141,9 +142,20 @@ module.exports = {
     }
 
     api.onFrontendMessage('resume', ({ id }) => {
+      try { require('node:fs').appendFileSync('/tmp/clideck-resume-debug.log', `${new Date().toISOString()} [resume] click id=${id}\n`); } catch {}
       const dir = join(root, id);
-      if (!state.exists(dir)) return;
+      if (!state.exists(dir)) {
+        api.log(`[resume] state.json missing at ${dir} — ignoring`);
+        api.sendToFrontend('warn', { message: `Cannot resume ${id}: state.json not found.` });
+        return;
+      }
+      if (ctx.workflows.has(id)) {
+        // Already running in this server lifetime — just refresh the UI.
+        api.sendToFrontend('list', { workflows: listAll() });
+        return;
+      }
       const s = state.read(dir);
+      api.log(`[resume] starting ${id} at stage=${s.currentStage} branch=${s.branch}`);
       // re-register inFlight branch
       const set = ctx.inFlightBranches.get(s.projectId) || new Set();
       if (s.branch) set.add(s.branch);
@@ -179,15 +191,38 @@ module.exports = {
       });
       ctx.workflows.set(id, { dir, runner });
       watchStateFile(id, dir);
-      runner.start();
+      try {
+        runner.start();
+      } catch (e) {
+        api.log(`[resume] runner.start threw: ${e.message}`);
+        api.sendToFrontend('warn', { message: `Resume failed for ${id}: ${e.message}` });
+        ctx.workflows.delete(id);
+        return;
+      }
+      api.sendToFrontend('list', { workflows: listAll() });
       api.log(`Resumed workflow ${id} at stage ${s.currentStage}`);
     });
 
     function listAll() {
-      return wf.listWorkflows(root).map((id) => state.read(join(root, id)));
+      // Annotate each workflow with `running` so the client can hide a stale
+      // resume banner once the runner is engaged in this server lifetime.
+      return wf.listWorkflows(root).map((id) => {
+        const s = state.read(join(root, id));
+        return { ...s, running: ctx.workflows.has(s.id) };
+      });
     }
 
-    api.onFrontendMessage('list', () => api.sendToFrontend('list', { workflows: listAll() }));
+    api.onFrontendMessage('list', () => {
+      api.sendToFrontend('list', { workflows: listAll() });
+      // Re-emit resume-prompt for any workflows that are not yet running in this server lifetime.
+      // Without this, a user who connects after server boot (or reloads the tab) sees no resume banner.
+      const stillResumable = resume.findResumable(root).filter((s) => !ctx.workflows.has(s.id));
+      if (stillResumable.length) {
+        api.sendToFrontend('resume-prompt', {
+          workflows: stillResumable.map((s) => ({ id: s.id, title: s.title, currentStage: s.currentStage })),
+        });
+      }
+    });
 
     async function finalize(s, workflowDir) {
       if (s.currentStage !== 'done' && s.currentStage !== 'failed') return;
@@ -204,6 +239,25 @@ module.exports = {
           api.log(`finalize: gh call failed for workflow ${s.id}: ${e.message}`);
         }
       }
+
+      // Rhythm notification path:
+      //   Success → handled by the obsidian-record stage agent via
+      //     rhythm_notify (it also writes the Obsidian record).
+      //   Failure → no obsidian-record runs, so fall back to this
+      //     finalize-time task creation. Guarded by rhythmCompletionNotified
+      //     so duplicates can't sneak in if finalize fires twice.
+      if (s.currentStage === 'failed') {
+        const rhythmEnabled = api.getSetting('rhythmEnabled') !== false;
+        if (rhythmEnabled && ctx.rhythmAvailable && !s.rhythmCompletionNotified) {
+          try {
+            await rhythm.notifyCompletion(api, s);
+            state.update(workflowDir, (cur) => { cur.rhythmCompletionNotified = true; });
+            api.log(`finalize: rhythm failure notification sent for ${s.id}`);
+          } catch (e) {
+            api.log(`finalize: rhythm notification failed for ${s.id}: ${e.message}`);
+          }
+        }
+      }
     }
 
     api.onFrontendMessage('create', (msg) => {
@@ -214,7 +268,26 @@ module.exports = {
       }
       const inFlight = ctx.inFlightBranches.get(projectId) || new Set();
       const finalTitle = (title && title.trim()) || description.split('\n')[0].slice(0, 80);
-      let finalBranch = branchInput && branchInput !== 'auto' ? branchInput : branch.slugFromTitle(finalTitle);
+      const userProvidedBranch = branchInput && branchInput !== 'auto';
+      let finalBranch;
+      if (userProvidedBranch) {
+        finalBranch = branch.sanitizeBranch(branchInput);
+        if (!finalBranch) {
+          api.sendToFrontend('warn', {
+            message: `Branch "${branchInput}" is not a valid git ref name. Use letters, digits, /, _, ., - (no spaces).`,
+          });
+          return;
+        }
+      } else {
+        finalBranch = branch.slugFromTitle(finalTitle);
+      }
+      // Defense-in-depth: never let an invalid name through (e.g. slugFromTitle bug, future caller).
+      if (!branch.isValidBranch(finalBranch)) {
+        api.sendToFrontend('warn', {
+          message: `Could not derive a valid git branch name from "${userProvidedBranch ? branchInput : finalTitle}".`,
+        });
+        return;
+      }
       if (branch.isCollision(finalBranch, inFlight)) {
         api.sendToFrontend('warn', {
           message: `Branch "${finalBranch}" is already in use by another in-flight workflow on this project. Pick a different name.`,
@@ -272,11 +345,43 @@ module.exports = {
       runner.start();
     });
 
+    // Surface the cfg.projects list to the new-workflow form so the user can
+    // pick the target repo from a dropdown instead of having to rely on the
+    // dashboard's currently-selected project. Without an explicit project,
+    // the runner-level cwd resolution falls back to ~/Documents and the
+    // stage agents end up working in the wrong place.
+    api.onFrontendMessage('projects.list', () => {
+      const projects = (api.getProjects ? api.getProjects() : [])
+        .map((p) => ({ id: p.id, name: p.name, path: p.path }));
+      api.sendToFrontend('projects.list', { projects });
+    });
+
+    // Add a new project entry to cfg.projects. The form sends this when the
+    // user picks "+ Add new repo…" and types a path. Backend validates the
+    // path exists; on success the form re-fetches the project list.
+    api.onFrontendMessage('projects.add', ({ name, path: projPath }) => {
+      if (!api.addProject) {
+        api.sendToFrontend('projects.add.result', { success: false, error: 'addProject unavailable in this CliDeck version' });
+        return;
+      }
+      const res = api.addProject({ name, path: projPath });
+      if (res.error) {
+        api.sendToFrontend('projects.add.result', { success: false, error: res.error });
+        return;
+      }
+      api.sendToFrontend('projects.add.result', {
+        success: true,
+        existed: !!res.existed,
+        project: { id: res.project.id, name: res.project.name, path: res.project.path },
+      });
+    });
+
     api.onFrontendMessage('validate-branch', ({ projectId, branch: branchVal }) => {
       const set = ctx.inFlightBranches.get(projectId) || new Set();
       api.sendToFrontend('branch-validation', {
         branch: branchVal,
         inUse: !!(branchVal && set.has(branchVal)),
+        invalid: !!(branchVal && !branch.isValidBranch(branchVal)),
       });
     });
 

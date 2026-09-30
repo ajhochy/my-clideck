@@ -224,12 +224,58 @@ function buildApi(pluginId, pluginDir, state) {
         console.error(`[plugin:${pluginId}] createSession: no cfg or createSessionFn`);
         return null;
       }
-      const result = createSessionFn(opts, cfg);
+      // If the plugin gave us a projectId but no explicit cwd, resolve the
+      // project's path from cfg.projects and use that. Without this, the
+      // session falls back to cfg.defaultPath (~/Documents) and the spawned
+      // agent has no idea which repo it's supposed to be in — symptom: the
+      // workflow plugin's stage agents started doing work in unrelated
+      // sibling repos.
+      let resolved = opts;
+      if (opts && opts.projectId && !opts.cwd && Array.isArray(cfg.projects)) {
+        const proj = cfg.projects.find((p) => p.id === opts.projectId);
+        if (proj?.path) resolved = { ...opts, cwd: proj.path };
+      }
+      const result = createSessionFn(resolved, cfg);
       if (result.error) {
-        console.error(`[plugin:${pluginId}] createSession failed: ${result.error} opts=${JSON.stringify(opts)}`);
+        console.error(`[plugin:${pluginId}] createSession failed: ${result.error} opts=${JSON.stringify(resolved)}`);
         return null;
       }
       return result.id;
+    },
+    // Project management for plugins that need to associate sessions with a
+    // working directory. `getProjects` returns a shallow copy of cfg.projects;
+    // `addProject({ name, path })` appends a new entry (validating the path
+    // exists), saves config, broadcasts `config` so the dashboard re-renders,
+    // and returns the created project. Both are read/write on the user's
+    // global cfg — plugins should only use them with the user's intent.
+    getProjects() {
+      const cfg = getConfigFn?.();
+      return Array.isArray(cfg?.projects) ? cfg.projects.map((p) => ({ ...p })) : [];
+    },
+    addProject({ name, path: projPath, color }) {
+      const cfg = getConfigFn?.();
+      if (!cfg || !saveConfigFn) return { error: 'config unavailable' };
+      const fs = require('node:fs');
+      if (!projPath || typeof projPath !== 'string') return { error: 'path is required' };
+      try { if (!fs.statSync(projPath).isDirectory()) return { error: 'path is not a directory' }; }
+      catch { return { error: 'path does not exist' }; }
+      cfg.projects = Array.isArray(cfg.projects) ? cfg.projects : [];
+      const existing = cfg.projects.find((p) => p.path === projPath);
+      if (existing) return { project: { ...existing }, existed: true };
+      const project = {
+        id: require('node:crypto').randomUUID(),
+        name: String(name || require('node:path').basename(projPath)).slice(0, 80),
+        path: projPath,
+        color: color || '#6366f1',
+        collapsed: false,
+      };
+      cfg.projects.push(project);
+      saveConfigFn(cfg);
+      // Note: the main dashboard's project list won't refresh until the next
+      // config fetch (we don't broadcast `config` from here because the raw
+      // cfg shape isn't filtered the way configForClient does it). The
+      // workflow plugin's form updates its own dropdown from the response.
+      return { project: { ...project }, existed: false };
     },
     closeSession(id) {
       const cfg = getConfigFn?.();

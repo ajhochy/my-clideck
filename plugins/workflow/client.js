@@ -10,6 +10,10 @@ let _api = null;
 let panelEl = null;
 let visible = false;
 let pendingResumables = null;
+let lastWorkflows = []; // cached for re-render without round-tripping the server
+let knownProjects = []; // cached list from backend; populated when the form opens
+let selectedProjectId = null; // form-local selection (overrides dashboard's active project)
+let pendingAddProject = null; // resolver for the in-flight projects.add round-trip
 let expandedId = null;
 let branchValidateTimer = null;
 const agentOutput = new Map(); // workflowId -> tail string (capped)
@@ -37,8 +41,30 @@ function appendAgentOutput(id, text) {
   }
 }
 
-const STAGE_ORDER = ['planning', 'issues', 'pipeline', 'smoketest'];
-const STAGE_LABELS = { planning: 'Planning', issues: 'Issues', pipeline: 'Pipeline', smoketest: 'Smoke test' };
+const STAGE_ORDER = ['planning', 'issues', 'pipeline', 'manual-setup', 'smoketest', 'obsidian-record'];
+const STAGE_LABELS = {
+  planning: 'Planning',
+  issues: 'Issues',
+  pipeline: 'Pipeline',
+  'manual-setup': 'Manual setup',
+  smoketest: 'Smoke test',
+  'obsidian-record': 'Record + notify',
+};
+
+// Derive a stageProgress entry for the current stage from state when the runner
+// hasn't written one. Manual setup is tracked as `confirmedAt` timestamps on
+// each item in `manualSetup`, not via report-progress.js, so we compute the
+// fraction here instead of waiting on the runner to mirror it.
+function deriveStageProgress(w) {
+  if (w?.currentStage === 'manual-setup' && Array.isArray(w.manualSetup) && w.manualSetup.length) {
+    const total = w.manualSetup.length;
+    const done = w.manualSetup.filter((i) => i && i.confirmedAt).length;
+    const remaining = total - done;
+    const label = remaining === 0 ? 'all confirmed' : `${remaining} step${remaining === 1 ? '' : 's'} pending`;
+    return { current: done, total, label };
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Panel DOM bootstrap
@@ -178,14 +204,28 @@ function render(list) {
     row.appendChild(metaDiv);
 
     const stageDiv = document.createElement('div');
-    stageDiv.style.cssText = 'font-size:12px;margin-top:4px;';
-    stageDiv.textContent = `Stage: ${w.currentStage || 'unknown'}`;
+    stageDiv.style.cssText = 'font-size:12px;margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;';
+    const stageText = document.createElement('span');
+    stageText.textContent = `Stage: ${w.currentStage || 'unknown'}`;
+    stageDiv.appendChild(stageText);
+    // Fix-loop indicator: when smoketest has failed and the runner is re-running
+    // earlier stages with the failures as fix-targets, surface that — otherwise
+    // the user just sees "Stage: planning" again with no hint that the deck
+    // was reshuffled by a smoketest miss.
+    const fixCount = Array.isArray(w.fixAttempts) ? w.fixAttempts.length : 0;
+    if (fixCount > 0 && w.currentStage !== 'done' && w.currentStage !== 'failed') {
+      const badge = document.createElement('span');
+      badge.title = 'Smoketest failed previously — runner is replanning to fix it.';
+      badge.style.cssText = 'font-size:10px;padding:1px 6px;border-radius:8px;background:#7c2d12;color:#fed7aa;border:1px solid #b45309;font-weight:600;letter-spacing:0.02em;';
+      badge.textContent = `↻ fix attempt ${fixCount}`;
+      stageDiv.appendChild(badge);
+    }
     row.appendChild(stageDiv);
 
     // Progress bar (always visible until done/failed).
     if (w.currentStage !== 'done' && w.currentStage !== 'failed') {
       ensureProgressStyles();
-      const prog = w.stageProgress && w.stageProgress[w.currentStage];
+      const prog = (w.stageProgress && w.stageProgress[w.currentStage]) || deriveStageProgress(w);
       const wrap = document.createElement('div');
       if (prog && prog.total > 0) {
         const labelLine = document.createElement('div');
@@ -213,6 +253,25 @@ function render(list) {
     if (isExpanded) {
       const detail = document.createElement('div');
       detail.style.cssText = 'margin-top:8px;border-top:1px solid #374151;padding-top:8px;';
+
+      // Fix-attempt context: show timestamps + failure count for each prior pass.
+      if (fixCount > 0) {
+        const fixBox = document.createElement('div');
+        fixBox.style.cssText = 'margin-bottom:8px;padding:6px 8px;border:1px solid #b45309;background:#451a03;border-radius:4px;font-size:11px;';
+        const heading = document.createElement('div');
+        heading.style.cssText = 'color:#fed7aa;font-weight:600;margin-bottom:4px;';
+        heading.textContent = `Fix loop · ${fixCount} prior attempt${fixCount === 1 ? '' : 's'} from failed smoketest`;
+        fixBox.appendChild(heading);
+        for (const a of (w.fixAttempts || [])) {
+          const line = document.createElement('div');
+          line.style.cssText = 'opacity:0.8;';
+          const when = a.startedAt ? new Date(a.startedAt).toLocaleString() : '(unknown time)';
+          const failuresN = Array.isArray(a.failures) ? a.failures.length : 0;
+          line.textContent = `• ${when} — ${failuresN} failure${failuresN === 1 ? '' : 's'} addressed`;
+          fixBox.appendChild(line);
+        }
+        detail.appendChild(fixBox);
+      }
 
       // Stage checklist
       const stageList = document.createElement('div');
@@ -340,6 +399,115 @@ function renderForm() {
   const inputStyle = 'width:100%;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:6px;font-size:13px;box-sizing:border-box;margin-bottom:8px;font-family:inherit;';
   const labelStyle = 'display:block;margin-bottom:4px;font-size:12px;opacity:0.8;';
 
+  // Project selector — drives the spawned-agent cwd. Without this, the
+  // dashboard's active-project leaks into the workflow and the wrong repo
+  // gets touched.
+  const projLabel = document.createElement('label');
+  projLabel.style.cssText = labelStyle;
+  projLabel.textContent = 'Project';
+  p.appendChild(projLabel);
+
+  const projSelect = document.createElement('select');
+  projSelect.id = 'wf-project';
+  projSelect.style.cssText = inputStyle;
+  p.appendChild(projSelect);
+
+  // Inline add-new-repo controls — hidden until the "+ Add new repo…" option is chosen.
+  const addRow = document.createElement('div');
+  addRow.id = 'wf-add-project';
+  addRow.style.cssText = 'display:none;gap:6px;margin-bottom:8px;';
+  const addPath = document.createElement('input');
+  addPath.type = 'text';
+  addPath.placeholder = '/Users/ajhochhalter/Documents/MyRepo';
+  addPath.style.cssText = inputStyle + 'flex:1;margin-bottom:0;';
+  const addName = document.createElement('input');
+  addName.type = 'text';
+  addName.placeholder = 'Display name (optional)';
+  addName.style.cssText = inputStyle + 'flex:1;margin-bottom:0;';
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.textContent = 'Add';
+  addBtn.style.cssText = 'background:#4f46e5;border:none;color:#fff;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:13px;flex-shrink:0;';
+  addRow.appendChild(addPath);
+  addRow.appendChild(addName);
+  addRow.appendChild(addBtn);
+  p.appendChild(addRow);
+
+  const ADD_NEW_VALUE = '__add_new__';
+  function rebuildProjOptions() {
+    projSelect.innerHTML = '';
+    if (!knownProjects.length) {
+      const empty = document.createElement('option');
+      empty.value = '';
+      empty.textContent = '(no projects yet — add one below)';
+      empty.disabled = true;
+      empty.selected = true;
+      projSelect.appendChild(empty);
+    } else {
+      for (const proj of knownProjects) {
+        const opt = document.createElement('option');
+        opt.value = proj.id;
+        opt.textContent = `${proj.name} — ${proj.path}`;
+        projSelect.appendChild(opt);
+      }
+    }
+    const addOpt = document.createElement('option');
+    addOpt.value = ADD_NEW_VALUE;
+    addOpt.textContent = '+ Add new repo…';
+    projSelect.appendChild(addOpt);
+    // Restore selection if still valid; else fall back to the dashboard's active project; else first available
+    const fallbackActive = (typeof _api.getActiveProjectId === 'function' && _api.getActiveProjectId()) || null;
+    const target = (selectedProjectId && knownProjects.some((p) => p.id === selectedProjectId))
+      ? selectedProjectId
+      : (knownProjects.some((p) => p.id === fallbackActive) ? fallbackActive : (knownProjects[0]?.id || ''));
+    if (target) {
+      projSelect.value = target;
+      selectedProjectId = target;
+    }
+    addRow.style.display = projSelect.value === ADD_NEW_VALUE ? 'flex' : 'none';
+  }
+
+  projSelect.onchange = () => {
+    if (projSelect.value === ADD_NEW_VALUE) {
+      addRow.style.display = 'flex';
+      addPath.focus();
+    } else {
+      addRow.style.display = 'none';
+      selectedProjectId = projSelect.value;
+    }
+  };
+
+  addBtn.onclick = () => {
+    const projPath = addPath.value.trim();
+    const projName = addName.value.trim();
+    const warn = document.getElementById('wf-warn');
+    if (!projPath) {
+      if (warn) warn.textContent = 'Path is required to add a project.';
+      return;
+    }
+    addBtn.disabled = true;
+    addBtn.textContent = '…';
+    pendingAddProject = (result) => {
+      addBtn.disabled = false;
+      addBtn.textContent = 'Add';
+      if (!result.success) {
+        if (warn) warn.textContent = `Add failed: ${result.error}`;
+        return;
+      }
+      // Insert (or pick up existing) and select it.
+      if (!knownProjects.some((p) => p.id === result.project.id)) knownProjects.push(result.project);
+      selectedProjectId = result.project.id;
+      addPath.value = '';
+      addName.value = '';
+      rebuildProjOptions();
+    };
+    _api.send('projects.add', { name: projName, path: projPath });
+  };
+
+  // Kick off the initial project-list fetch.
+  rebuildProjOptions();
+  _api.send('projects.list');
+
   // Description field
   const descLabel = document.createElement('label');
   descLabel.style.cssText = labelStyle;
@@ -414,7 +582,14 @@ function renderForm() {
       return;
     }
 
-    const projectId = (typeof _api.getActiveProjectId === 'function' && _api.getActiveProjectId()) || 'unknown';
+    // Prefer the explicit dropdown selection; fall back to dashboard active project; finally fail loudly.
+    const dropdownVal = projSelect.value;
+    const fallback = (typeof _api.getActiveProjectId === 'function' && _api.getActiveProjectId()) || null;
+    const projectId = (dropdownVal && dropdownVal !== ADD_NEW_VALUE && dropdownVal) || fallback || 'unknown';
+    if (projectId === 'unknown') {
+      warnEl.textContent = 'Pick a project (or add a new one) so the agent works in the right repo.';
+      return;
+    }
 
     _api.send('create', { description, title: wfTitle, branch, projectId });
     startBtn.disabled = true;
@@ -448,6 +623,16 @@ export function init(api) {
   // Receive workflow list from backend
   api.onMessage('list', (msg) => {
     const workflows = Array.isArray(msg?.workflows) ? msg.workflows : [];
+    // Drop resume banner entries for workflows the backend now reports as
+    // running — the runner is already engaged, no resume needed. Guard against
+    // pendingResumables being null (its initial state); reading .length on
+    // null throws TypeError, which would kill the list handler and leave the
+    // panel un-rendered — symptom: workflow toolbar/menu silently disappears.
+    const runningIds = new Set(workflows.filter((w) => w.running).map((w) => w.id));
+    if (runningIds.size && pendingResumables && pendingResumables.length) {
+      pendingResumables = pendingResumables.filter((r) => !runningIds.has(r.id));
+    }
+    lastWorkflows = workflows;
     render(workflows);
   });
 
@@ -481,12 +666,13 @@ export function init(api) {
   // Resume prompt from backend — show in-flight workflows banner
   api.onMessage('resume-prompt', ({ workflows }) => {
     if (!workflows || !workflows.length) return;
-    // Open the panel and insert a banner section at the top
     visible = true;
     ensurePanel().style.display = 'block';
-    // After the next render, insert the banner. Simplest: maintain a pendingResumables variable and have render() pick it up.
     pendingResumables = workflows;
-    _api.send('list'); // trigger a re-render
+    // Render directly with the most recent list we have — do NOT round-trip a
+    // fresh `list` request, because the server piggybacks resume-prompt on its
+    // list response, which would put us back here in an infinite loop.
+    render(lastWorkflows);
   });
 
   // Focus a session when the backend asks
@@ -495,6 +681,46 @@ export function init(api) {
   });
 
   // Live branch-collision validation response from backend
+  // Refresh the project dropdown when backend returns the list.
+  api.onMessage('projects.list', ({ projects }) => {
+    knownProjects = Array.isArray(projects) ? projects : [];
+    // If the form is open, re-render the dropdown in place. We look up by id
+    // to avoid a full renderForm() which would reset the description/branch fields.
+    const sel = document.getElementById('wf-project');
+    if (sel) {
+      const event = new Event('refresh-projects');
+      sel.dispatchEvent(event);
+      // Simplest: trigger a fresh renderForm only if no description is typed yet.
+      // Otherwise, manually rebuild the options.
+      const optsToKeep = [...sel.options].map((o) => o.value);
+      sel.innerHTML = '';
+      const ADD_NEW_VALUE = '__add_new__';
+      for (const proj of knownProjects) {
+        const opt = document.createElement('option');
+        opt.value = proj.id;
+        opt.textContent = `${proj.name} — ${proj.path}`;
+        sel.appendChild(opt);
+      }
+      const addOpt = document.createElement('option');
+      addOpt.value = ADD_NEW_VALUE;
+      addOpt.textContent = '+ Add new repo…';
+      sel.appendChild(addOpt);
+      // Restore last selection if still valid
+      if (selectedProjectId && knownProjects.some((p) => p.id === selectedProjectId)) {
+        sel.value = selectedProjectId;
+      } else if (knownProjects[0]) {
+        sel.value = knownProjects[0].id;
+        selectedProjectId = sel.value;
+      }
+    }
+  });
+
+  api.onMessage('projects.add.result', (result) => {
+    if (typeof pendingAddProject === 'function') {
+      try { pendingAddProject(result); } finally { pendingAddProject = null; }
+    }
+  });
+
   api.onMessage('branch-validation', ({ branch: b, inUse }) => {
     const inputEl = document.getElementById('wf-branch');
     const warnEl = document.getElementById('wf-warn');

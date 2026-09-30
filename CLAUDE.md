@@ -17,3 +17,6 @@ After significant work, log to `docs/ai/` (never to one growing file):
 - **Each durable decision** → create `docs/ai/decisions/YYYY-MM-DD-<slug>.md` — frontmatter `tags: [decision, <repo>]`; Context / Decision / Alternatives / Consequences.
 
 Do **not** write session logs to the Obsidian vault note via `obsidian_post_file` — that path is retired; it created a second, divergent log. The vault note is now a read-only index that links to these `docs/ai/` files.
+
+## Worktree hygiene
+Once a branch's work is committed and pushed to a PR, remove its worktree immediately (`git worktree remove <path> && git worktree prune`) and squash-delete the local branch. Never leave worktrees checked out after PR creation; idle worktrees keep compiling, watching, and eating disk. One active worktree per task, gone when the PR opens.
